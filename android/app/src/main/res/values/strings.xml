@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Violin Journal</string>
+    <string name="title_activity_main">Violin Journal</string>
+    <string name="package_name">com.violinjournal.app</string>
+    <string name="custom_url_scheme">com.violinjournal.app</string>
+</resources>

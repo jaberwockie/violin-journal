@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
-const SK = { sessions: "violin_sessions", pieces: "violin_pieces", goals: "violin_goals", reminders: "violin_reminders" };
+const SK = { sessions: "violin_sessions", pieces: "violin_pieces", goals: "violin_goals", reminders: "violin_reminders", focusAreas: "violin_focus_areas" };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function todayStr() { return new Date().toISOString().slice(0, 10); }
@@ -37,7 +37,7 @@ body{background:var(--cream);font-family:'Lato',sans-serif;color:var(--text);}
 .app{min-height:100vh;background:var(--cream);
   background-image:radial-gradient(ellipse at 10% 20%,rgba(181,84,28,.07) 0%,transparent 50%),
     radial-gradient(ellipse at 90% 80%,rgba(107,124,92,.08) 0%,transparent 50%);}
-.header{background:var(--brown);padding:14px 22px;display:flex;align-items:center;justify-content:space-between;
+.header{background:var(--brown);padding:14px 22px;padding-top:calc(14px + env(safe-area-inset-top));display:flex;align-items:center;justify-content:space-between;
   box-shadow:0 4px 20px rgba(44,26,14,.3);position:sticky;top:0;z-index:100;gap:12px;flex-wrap:wrap;}
 .header-title{font-family:'Playfair Display',serif;font-size:1.45rem;color:var(--warm1);letter-spacing:.02em;white-space:nowrap;}
 .header-title span{color:var(--rust-light);font-style:italic;}
@@ -47,7 +47,7 @@ body{background:var(--cream);font-family:'Lato',sans-serif;color:var(--text);}
   cursor:pointer;transition:all .2s;white-space:nowrap;}
 .nav-btn:hover{background:rgba(255,255,255,.1);color:white;}
 .nav-btn.active{background:var(--rust);color:white;}
-.main{max-width:960px;margin:0 auto;padding:24px 18px;}
+.main{max-width:960px;margin:0 auto;padding:24px 18px;padding-bottom:calc(24px + env(safe-area-inset-bottom));padding-left:calc(18px + env(safe-area-inset-left));padding-right:calc(18px + env(safe-area-inset-right));}
 .card{background:white;border-radius:var(--radius);padding:20px;box-shadow:0 2px 12px var(--shadow);border:1px solid var(--warm2);}
 .card-title{font-family:'Playfair Display',serif;font-size:1.05rem;color:var(--brown);margin-bottom:14px;display:flex;align-items:center;gap:8px;}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
@@ -178,52 +178,115 @@ function Metronome() {
   const [rampEveryBars, setRampEveryBars] = useState(2);
   const [rampAmount, setRampAmount] = useState(5);
   const [rampMax, setRampMax] = useState(160);
+
+  // All scheduler state lives in refs — never stale inside the scheduler loop
+  const audioCtxRef = useRef(null);
+  const schedulerTimerRef = useRef(null);
+  const nextBeatTimeRef = useRef(0);   // audioCtx time of the next beat to schedule
+  const beatIdxRef = useRef(0);        // global beat counter
+  const barCountRef = useRef(0);
+
+  // Mirrored refs so scheduler always reads latest values without re-closures
   const bpmRef = useRef(bpm);
   const bpbRef = useRef(beatsPerBar);
-  const beatIdxRef = useRef(0);
-  const barCountRef = useRef(0);
-  const intervalRef = useRef(null);
-  const audioCtxRef = useRef(null);
   const rampRef = useRef({ enabled: false, everyBars: 2, amount: 5, max: 160 });
-  const tickRef = useRef(null);
 
   useEffect(() => { bpmRef.current = bpm; }, [bpm]);
   useEffect(() => { bpbRef.current = beatsPerBar; }, [beatsPerBar]);
   useEffect(() => { rampRef.current = { enabled: rampEnabled, everyBars: rampEveryBars, amount: rampAmount, max: rampMax }; }, [rampEnabled, rampEveryBars, rampAmount, rampMax]);
 
-  const playClick = useCallback((isAccent) => {
-    if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+  // Schedule a single click at a precise audio time
+  const scheduleClick = useCallback((isAccent, atTime) => {
     const ctx = audioCtxRef.current;
-    const osc = ctx.createOscillator(); const gain = ctx.createGain();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
     osc.connect(gain); gain.connect(ctx.destination);
     osc.frequency.value = isAccent ? 1320 : 880;
-    gain.gain.setValueAtTime(isAccent ? 0.5 : 0.28, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + (isAccent ? 0.12 : 0.07));
-    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.15);
+    gain.gain.setValueAtTime(isAccent ? 0.5 : 0.28, atTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, atTime + (isAccent ? 0.12 : 0.07));
+    osc.start(atTime);
+    osc.stop(atTime + 0.15);
   }, []);
 
-  tickRef.current = () => {
-    const beatInBar = beatIdxRef.current % bpbRef.current;
-    playClick(beatInBar === 0);
-    setCurrentBeat(beatInBar);
-    beatIdxRef.current += 1;
-    if (beatInBar === bpbRef.current - 1) {
-      barCountRef.current += 1;
-      setCurrentBar(barCountRef.current);
-      const r = rampRef.current;
-      if (r.enabled && barCountRef.current % r.everyBars === 0) {
-        const newBpm = Math.min(r.max, bpmRef.current + r.amount);
-        bpmRef.current = newBpm; setBpm(newBpm);
-        clearInterval(intervalRef.current);
-        intervalRef.current = setInterval(() => tickRef.current(), (60 / newBpm) * 1000);
+  // The lookahead scheduler — runs every 25ms, schedules beats up to 100ms ahead
+  // This means timing is driven by the audio clock, not the JS event loop
+  const LOOKAHEAD_MS = 25;       // how often scheduler runs (ms)
+  const SCHEDULE_AHEAD_S = 0.1;  // how far ahead to schedule (seconds)
+
+  const schedulerLoop = useCallback(() => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+
+    while (nextBeatTimeRef.current < ctx.currentTime + SCHEDULE_AHEAD_S) {
+      const beatInBar = beatIdxRef.current % bpbRef.current;
+
+      // Schedule the audio click at the precise future time
+      scheduleClick(beatInBar === 0, nextBeatTimeRef.current);
+
+      // Schedule a UI update ~10ms before the beat fires so visuals feel in sync
+      const delay = Math.max(0, (nextBeatTimeRef.current - ctx.currentTime) * 1000 - 10);
+      const capturedBeat = beatInBar;
+      setTimeout(() => {
+        setCurrentBeat(capturedBeat);
+      }, delay);
+
+      // Advance counters
+      beatIdxRef.current += 1;
+
+      if (beatInBar === bpbRef.current - 1) {
+        barCountRef.current += 1;
+        const capturedBar = barCountRef.current;
+        setTimeout(() => setCurrentBar(capturedBar), delay);
+
+        // Auto BPM ramp
+        const r = rampRef.current;
+        if (r.enabled && barCountRef.current % r.everyBars === 0) {
+          const newBpm = Math.min(r.max, bpmRef.current + r.amount);
+          bpmRef.current = newBpm;
+          setBpm(newBpm);
+        }
       }
+
+      // Advance next beat time using current bpm ref (may have been ramped)
+      nextBeatTimeRef.current += 60 / bpmRef.current;
     }
+  }, [scheduleClick]);
+
+  const stop = useCallback(() => {
+    clearInterval(schedulerTimerRef.current);
+    setRunning(false);
+    setCurrentBeat(-1);
+    setCurrentBar(0);
+    beatIdxRef.current = 0;
+    barCountRef.current = 0;
+  }, []);
+
+  const start = useCallback(() => {
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    // Resume context if suspended (browser autoplay policy)
+    if (audioCtxRef.current.state === "suspended") audioCtxRef.current.resume();
+
+    beatIdxRef.current = 0;
+    barCountRef.current = 0;
+    setCurrentBar(0);
+
+    // Start scheduling from slightly ahead of now so first beat isn't clipped
+    nextBeatTimeRef.current = audioCtxRef.current.currentTime + 0.05;
+
+    schedulerTimerRef.current = setInterval(schedulerLoop, LOOKAHEAD_MS);
+    setRunning(true);
+  }, [schedulerLoop]);
+
+  const handleBpm = (val) => {
+    const c = Math.max(20, Math.min(240, val));
+    setBpm(c);
+    bpmRef.current = c;
+    // No need to restart — scheduler reads bpmRef on each loop iteration
   };
 
-  const stop = () => { clearInterval(intervalRef.current); setRunning(false); setCurrentBeat(-1); setCurrentBar(0); beatIdxRef.current = 0; barCountRef.current = 0; };
-  const start = () => { beatIdxRef.current = 0; barCountRef.current = 0; setCurrentBar(0); tickRef.current(); intervalRef.current = setInterval(() => tickRef.current(), (60 / bpmRef.current) * 1000); setRunning(true); };
-  const handleBpm = (val) => { const c = Math.max(20, Math.min(240, val)); setBpm(c); bpmRef.current = c; if (running) { clearInterval(intervalRef.current); intervalRef.current = setInterval(() => tickRef.current(), (60 / c) * 1000); } };
-  useEffect(() => () => clearInterval(intervalRef.current), []);
+  useEffect(() => () => clearInterval(schedulerTimerRef.current), []);
 
   return (
     <div className="card" style={{ textAlign: "center", maxWidth: 420, margin: "0 auto" }}>
@@ -387,10 +450,21 @@ function Dashboard({ sessions, pieces, goals, setGoals, unit }) {
 }
 
 // ── LOG SESSION ───────────────────────────────────────────────────────────────
-const TAG_OPTIONS = ["Scales","Etudes","Repertoire","Bowing","Intonation","Sight-reading","Theory","Vibrato"];
-const BLANK_FORM = () => ({ date: todayStr(), duration: "", rating: 3, notes: "", tags: [], piece: "" });
+const VIOLIN_COMPOSERS = [
+  "Bach, J.S.","Bartók, Béla","Beethoven, Ludwig van","Berg, Alban",
+  "Brahms, Johannes","Bruch, Max","Chausson, Ernest","Corelli, Arcangelo",
+  "Dvořák, Antonín","Elgar, Edward","Franck, César","Glazunov, Alexander",
+  "Grieg, Edvard","Handel, G.F.","Haydn, Joseph","Kreisler, Fritz",
+  "Lalo, Édouard","Mendelssohn, Felix","Mozart, W.A.","Paganini, Niccolò",
+  "Prokofiev, Sergei","Ravel, Maurice","Saint-Saëns, Camille","Schubert, Franz",
+  "Shostakovich, Dmitri","Sibelius, Jean","Spohr, Louis","Strauss, Richard",
+  "Szymanowski, Karol","Tartini, Giuseppe","Tchaikovsky, Pyotr","Telemann, G.P.",
+  "Vieuxtemps, Henri","Viotti, Giovanni","Vivaldi, Antonio","Wieniawski, Henryk",
+];
+const DEFAULT_FOCUS_AREAS = ["Scales","Etudes","Repertoire","Bowing","Intonation","Sight-reading","Theory","Vibrato","General Practice"];
+const BLANK_FORM = () => ({ date: todayStr(), duration: "", rating: 3, notes: "", tags: [], piece: "", linkedGoals: [], linkedPiece: null, composer: "" });
 
-function LogSession({ sessions, setSessions, unit }) {
+function LogSession({ sessions, setSessions, unit, goals, focusAreas, pieces, setPieces }) {
   const [form, setForm] = useState(BLANK_FORM());
   const [saved, setSaved] = useState(false);
   const [confirmId, setConfirmId] = useState(null);
@@ -398,7 +472,140 @@ function LogSession({ sessions, setSessions, unit }) {
   const [search, setSearch] = useState("");
   const [filterTag, setFilterTag] = useState("");
 
+  // Timer state
+  const [timerSeconds, setTimerSeconds] = useState(0);
+  const [timerRunning, setTimerRunning] = useState(false);
+  const intervalRef = useRef(null);
+  const startTimeRef = useRef(null); // wall-clock time when timer was last started
+
+  // Load persisted timer on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get("violin_timer");
+        if (r) {
+          const saved = JSON.parse(r.value);
+          if (saved.running && saved.startedAt) {
+            // Timer was running when app closed — calculate elapsed time
+            const elapsed = Math.floor((Date.now() - saved.startedAt) / 1000);
+            const total = (saved.seconds || 0) + elapsed;
+            setTimerSeconds(total);
+            setTimerRunning(true);
+            startTimeRef.current = Date.now();
+            intervalRef.current = setInterval(() => setTimerSeconds(s => s + 1), 1000);
+          } else {
+            setTimerSeconds(saved.seconds || 0);
+          }
+        }
+      } catch {}
+    })();
+    return () => clearInterval(intervalRef.current);
+  }, []);
+
+  const persistTimer = async (seconds, running, startedAt = null) => {
+    try { await window.storage.set("violin_timer", JSON.stringify({ seconds, running, startedAt })); } catch {}
+  };
+
+  const timerStart = () => {
+    if (timerRunning) return;
+    const now = Date.now();
+    startTimeRef.current = now;
+    setTimerRunning(true);
+    intervalRef.current = setInterval(() => setTimerSeconds(s => s + 1), 1000);
+    persistTimer(timerSeconds, true, now);
+  };
+  const timerPause = () => {
+    clearInterval(intervalRef.current);
+    setTimerRunning(false);
+    persistTimer(timerSeconds, false);
+  };
+  const timerStop = () => {
+    clearInterval(intervalRef.current);
+    setTimerRunning(false);
+    if (timerSeconds === 0) return;
+    const totalMins = timerSeconds / 60;
+    const display = unit === "hrs"
+      ? +((totalMins / 60).toFixed(2))
+      : +(totalMins.toFixed(1));
+    setForm(f => ({ ...f, duration: String(display) }));
+    persistTimer(0, false);
+    setTimerSeconds(0);
+  };
+  const timerReset = () => {
+    clearInterval(intervalRef.current);
+    setTimerRunning(false);
+    setTimerSeconds(0);
+    persistTimer(0, false);
+  };
+
+  // Keep persisted seconds in sync while running
+  useEffect(() => {
+    if (timerRunning) {
+      persistTimer(timerSeconds, true, startTimeRef.current);
+    }
+  }, [timerSeconds, timerRunning]);
+
+  const fmtTimer = s => {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    return h > 0
+      ? `${h}:${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}`
+      : `${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}`;
+  };
+
   const toggleTag = t => setForm(f => ({ ...f, tags: f.tags.includes(t) ? f.tags.filter(x=>x!==t) : [...f.tags,t] }));
+  const toggleGoalLink = id => {
+    setForm(f => {
+      const already = (f.linkedGoals||[]).includes(id);
+      if (already) return { ...f, linkedGoals: f.linkedGoals.filter(x=>x!==id) };
+      // Auto-fill from goal when linking
+      const goal = goals.find(g => g.id === id);
+      const updates = { linkedGoals: [...(f.linkedGoals||[]), id] };
+      if (goal) {
+        // Fill piece/focus from goal label if not already filled
+        if (!f.piece && goal.label) updates.piece = goal.label;
+        // Fill tags from goal label if none set
+        if ((!f.tags || f.tags.length === 0) && goal.label) updates.tags = [goal.label];
+        // Fill target duration if duration empty (convert goal target to display unit)
+        if (!f.duration && goal.type === "weekly_minutes" && goal.target) {
+          const dailySuggestion = Math.round(goal.target / 5); // suggest 1/5th of weekly target
+          updates.duration = String(toDisplay(dailySuggestion, unit));
+        }
+      }
+      return { ...f, ...updates };
+    });
+  };
+
+  const togglePieceLink = id => {
+    setForm(f => {
+      if (f.linkedPiece === id) return { ...f, linkedPiece: null };
+      const p = pieces.find(x => x.id === id);
+      const updates = { linkedPiece: id };
+      if (p) {
+        if (!f.piece) updates.piece = p.title;
+        if (!f.composer && p.composer) updates.composer = p.composer;
+      }
+      return { ...f, ...updates };
+    });
+  };
+
+  const [customTags, setCustomTags] = useState([]);
+  const [addingTag, setAddingTag] = useState(false);
+  const [newTagInput, setNewTagInput] = useState("");
+
+  const submitNewTag = () => {
+    const trimmed = newTagInput.trim();
+    if (trimmed && !focusAreas.includes(trimmed) && !customTags.includes(trimmed)) {
+      setCustomTags(t => [...t, trimmed]);
+      setForm(f => ({ ...f, tags: [...f.tags, trimmed] }));
+    }
+    setNewTagInput("");
+    setAddingTag(false);
+  };
+
+  // Only show linkable goals (not custom/manual ones which have their own slider)
+  const linkableGoals = goals.filter(g => g.type !== "custom");
 
   const submit = async () => {
     if (!form.duration) return;
@@ -411,12 +618,17 @@ function LogSession({ sessions, setSessions, unit }) {
       updated = [{ ...form, id: Date.now(), duration: durationMins }, ...sessions];
     }
     setSessions(updated); await sSet(SK.sessions, updated);
+    // Update lastPracticed on linked piece
+    if (form.linkedPiece) {
+      const updatedPieces = pieces.map(p => p.id === form.linkedPiece ? { ...p, lastPracticed: form.date } : p);
+      setPieces(updatedPieces); await sSet(SK.pieces, updatedPieces);
+    }
     setForm(BLANK_FORM());
     setSaved(true); setTimeout(() => setSaved(false), 2000);
   };
 
   const startEdit = (s) => {
-    setForm({ date: s.date, duration: toDisplay(s.duration, unit), rating: s.rating, notes: s.notes||"", tags: s.tags||[], piece: s.piece||"" });
+    setForm({ date: s.date, duration: toDisplay(s.duration, unit), rating: s.rating, notes: s.notes||"", tags: s.tags||[], piece: s.piece||"", linkedGoals: s.linkedGoals||[], linkedPiece: s.linkedPiece||null, composer: s.composer||"" });
     setEditId(s.id);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
@@ -439,17 +651,156 @@ function LogSession({ sessions, setSessions, unit }) {
       <div className="grid2">
         <div className="card">
           <div className="card-title">{editId ? "✎ Edit Session" : "✍️ Log Practice Session"}</div>
+
+          {/* ── Timer ── */}
+          <div style={{ background:"var(--cream)", border:"1.5px solid var(--warm2)", borderRadius:10, padding:"12px 14px", marginBottom:14 }}>
+            <div style={{ fontSize:".72rem", fontWeight:700, color:"var(--text-mid)", textTransform:"uppercase", letterSpacing:".07em", marginBottom:8 }}>⏱ Practice Timer</div>
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:10 }}>
+              <div style={{ fontFamily:"'Playfair Display',serif", fontSize:"2rem", fontWeight:700, color: timerRunning ? "var(--rust)" : timerSeconds > 0 ? "var(--brown)" : "var(--text-light)", letterSpacing:".04em", minWidth:90 }}>
+                {fmtTimer(timerSeconds)}
+              </div>
+              <div style={{ display:"flex", gap:6 }}>
+                {!timerRunning ? (
+                  <button className="btn btn-primary btn-sm" onClick={timerStart} style={{ minWidth:56 }}>
+                    {timerSeconds === 0 ? "▶ Start" : "▶ Resume"}
+                  </button>
+                ) : (
+                  <button className="btn btn-ghost btn-sm" onClick={timerPause} style={{ minWidth:56 }}>⏸ Pause</button>
+                )}
+                <button className="btn btn-ghost btn-sm" onClick={timerStop} disabled={timerSeconds === 0}
+                  style={{ minWidth:52, opacity: timerSeconds === 0 ? 0.4 : 1 }} title="Stop and fill duration">
+                  ⏹ Stop
+                </button>
+                <button className="btn btn-ghost btn-sm" onClick={timerReset} disabled={timerSeconds === 0}
+                  style={{ minWidth:56, opacity: timerSeconds === 0 ? 0.4 : 1 }}>
+                  ↺ Reset
+                </button>
+              </div>
+            </div>
+            {timerSeconds > 0 && !timerRunning && (
+              <div style={{ fontSize:".74rem", color:"var(--text-light)", marginTop:6, fontStyle:"italic" }}>
+                Timer paused — will resume from here even if you navigate away.
+              </div>
+            )}
+          </div>
+
           <div className="field"><label>Date</label><input type="date" value={form.date} onChange={e => setForm(f=>({...f,date:e.target.value}))} /></div>
           <div className="field"><label>Duration ({unitLabel(unit)})</label><input type="number" placeholder={unit==="hrs"?"e.g. 0.75":"e.g. 45"} step={unit==="hrs"?"0.05":"1"} value={form.duration} onChange={e=>setForm(f=>({...f,duration:e.target.value}))} /></div>
-          <div className="field"><label>Piece / Focus</label><input type="text" placeholder="e.g. Bach Chaconne, Scales in D" value={form.piece} onChange={e=>setForm(f=>({...f,piece:e.target.value}))} /></div>
+          <div className="field">
+            <label>Composer</label>
+            <select
+              value={VIOLIN_COMPOSERS.includes(form.composer) || form.composer === "" ? form.composer : "__custom__"}
+              onChange={e => setForm(f=>({...f, composer: e.target.value === "__custom__" ? "" : e.target.value}))}>
+              <option value="__custom__">— Custom —</option>
+              {VIOLIN_COMPOSERS.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+            {!VIOLIN_COMPOSERS.includes(form.composer) && (
+              <input
+                type="text"
+                placeholder="Type composer name…"
+                value={form.composer}
+                onChange={e => setForm(f=>({...f, composer: e.target.value}))}
+                style={{ marginTop: 6 }}
+                autoFocus
+              />
+            )}
+          </div>
+          <div className="field"><label>Piece / Focus</label><input type="text" placeholder="e.g. Chaconne, Sonata No.1, Scales in D" value={form.piece} onChange={e=>setForm(f=>({...f,piece:e.target.value}))} /></div>
           <div className="field"><label>Rating</label><StarRating value={form.rating} onChange={r=>setForm(f=>({...f,rating:r}))} /></div>
           <div className="field">
             <label>Focus Areas</label>
             <div style={{ display:"flex",flexWrap:"wrap",gap:5,marginTop:4 }}>
-              {TAG_OPTIONS.map(t => <button key={t} onClick={()=>toggleTag(t)} className="btn btn-ghost btn-sm" style={{ background:form.tags.includes(t)?"var(--rust)":undefined,color:form.tags.includes(t)?"white":undefined }}>{t}</button>)}
+              {[...focusAreas, ...customTags].map(t => (
+                <button key={t} onClick={()=>toggleTag(t)} className="btn btn-ghost btn-sm"
+                  style={{ background:form.tags.includes(t)?"var(--rust)":undefined, color:form.tags.includes(t)?"white":undefined }}>
+                  {t}
+                </button>
+              ))}
+              {addingTag ? (
+                <div style={{ display:"flex", gap:4, alignItems:"center" }}>
+                  <input
+                    autoFocus
+                    value={newTagInput}
+                    onChange={e => setNewTagInput(e.target.value)}
+                    onKeyDown={e => { if (e.key==="Enter") submitNewTag(); if (e.key==="Escape") { setAddingTag(false); setNewTagInput(""); } }}
+                    placeholder="New focus area…"
+                    style={{ width:130, padding:"3px 8px", fontSize:".78rem" }}
+                  />
+                  <button className="btn btn-primary btn-sm" onClick={submitNewTag}>Add</button>
+                  <button className="btn btn-ghost btn-sm" onClick={()=>{ setAddingTag(false); setNewTagInput(""); }}>×</button>
+                </div>
+              ) : (
+                <button className="btn btn-ghost btn-sm" onClick={()=>setAddingTag(true)}
+                  style={{ border:"1.5px dashed var(--warm2)", color:"var(--text-light)" }}>
+                  + Add New
+                </button>
+              )}
             </div>
           </div>
           <div className="field"><label>Notes</label><textarea rows={3} placeholder="How did it go?" value={form.notes} onChange={e=>setForm(f=>({...f,notes:e.target.value}))} /></div>
+          {pieces.filter(p => p.status !== "wishlist").length > 0 && (
+            <div className="field">
+              <label>Link to Piece</label>
+              <div style={{ display:"flex",flexDirection:"column",gap:5,marginTop:4 }}>
+                {pieces.filter(p => p.status !== "wishlist").map(p => {
+                  const linked = form.linkedPiece === p.id;
+                  return (
+                    <button key={p.id} onClick={()=>togglePieceLink(p.id)}
+                      style={{
+                        display:"flex", alignItems:"center", gap:8, padding:"7px 11px",
+                        borderRadius:8, border:`1.5px solid ${linked?"var(--sage)":"var(--warm2)"}`,
+                        background: linked?"#f0f5ee":"var(--cream)", cursor:"pointer",
+                        textAlign:"left", width:"100%", transition:"all .15s",
+                      }}>
+                      <div style={{
+                        width:16, height:16, borderRadius:4, flexShrink:0,
+                        border:`2px solid ${linked?"var(--sage)":"var(--warm2)"}`,
+                        background: linked?"var(--sage)":"transparent",
+                        display:"flex", alignItems:"center", justifyContent:"center",
+                      }}>
+                        {linked && <span style={{color:"white",fontSize:".65rem",fontWeight:900}}>✓</span>}
+                      </div>
+                      <span style={{fontSize:".82rem",color:"var(--text)",fontWeight:linked?700:400,flex:1}}>{p.title}</span>
+                      {p.composer && <span style={{fontSize:".74rem",color:"var(--text-light)",fontStyle:"italic"}}>{p.composer}</span>}
+                      <span className={`status-badge status-${p.status}`} style={{fontSize:".68rem"}}>{p.status}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <div style={{fontSize:".74rem",color:"var(--text-light)",marginTop:6}}>💡 Linking a piece auto-fills the title & composer, and updates its "last practiced" date when you save.</div>
+            </div>
+          )}
+          {linkableGoals.length > 0 && (
+            <div className="field">
+              <label>Link to Goals</label>
+              <div style={{ display:"flex",flexDirection:"column",gap:5,marginTop:4 }}>
+                {linkableGoals.map(g => {
+                  const linked = (form.linkedGoals||[]).includes(g.id);
+                  return (
+                    <button key={g.id} onClick={()=>toggleGoalLink(g.id)}
+                      style={{
+                        display:"flex", alignItems:"center", gap:8, padding:"7px 11px",
+                        borderRadius:8, border:`1.5px solid ${linked?"var(--rust)":"var(--warm2)"}`,
+                        background: linked?"#fff5f0":"var(--cream)", cursor:"pointer",
+                        textAlign:"left", width:"100%", transition:"all .15s",
+                      }}>
+                      <div style={{
+                        width:16, height:16, borderRadius:4, flexShrink:0,
+                        border:`2px solid ${linked?"var(--rust)":"var(--warm2)"}`,
+                        background: linked?"var(--rust)":"transparent",
+                        display:"flex", alignItems:"center", justifyContent:"center",
+                      }}>
+                        {linked && <span style={{color:"white",fontSize:".65rem",fontWeight:900}}>✓</span>}
+                      </div>
+                      <span style={{fontSize:".82rem",color:"var(--text)",fontWeight:linked?700:400}}>{g.label}</span>
+                      <span style={{fontSize:".72rem",color:"var(--text-light)",marginLeft:"auto"}}>{linked ? "✓ auto-filled" : `${toDisplay(g.target,unit)}${unitLabel(unit)} goal`}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <div style={{fontSize:".74rem",color:"var(--text-light)",marginTop:6}}>💡 Ticking a goal auto-fills the piece and duration. Just add the date and time to save.</div>
+            </div>
+          )}
           <div style={{ display:"flex",gap:8 }}>
             <button className="btn btn-primary" onClick={submit} style={{ flex:1 }}>{editId ? "Save Changes" : saved ? "✓ Logged!" : "Log Session"}</button>
             {editId && <button className="btn btn-ghost" onClick={cancelEdit}>Cancel</button>}
@@ -461,7 +812,7 @@ function LogSession({ sessions, setSessions, unit }) {
             <input placeholder="🔍 Search piece or notes…" value={search} onChange={e=>setSearch(e.target.value)} />
             <select value={filterTag} onChange={e=>setFilterTag(e.target.value)} style={{ width:130,flex:"none" }}>
               <option value="">All tags</option>
-              {TAG_OPTIONS.map(t=><option key={t} value={t}>{t}</option>)}
+              {focusAreas.map(t=><option key={t} value={t}>{t}</option>)}
             </select>
           </div>
           {filtered.length===0 && <div className="empty-state">{sessions.length===0?"No sessions yet!":"No sessions match your search."}</div>}
@@ -474,8 +825,22 @@ function LogSession({ sessions, setSessions, unit }) {
                     <span className="session-dur">{toDisplay(s.duration,unit)}{unitLabel(unit)}</span>
                     <span style={{ color:"#b5541c",fontSize:".85rem" }}>{"★".repeat(s.rating)}</span>
                   </div>
-                  {s.piece && <div style={{ fontSize:".8rem",color:"var(--text-mid)",marginTop:2 }}>{s.piece}</div>}
+                  {(s.composer || s.piece) && (
+                    <div style={{ fontSize:".8rem",color:"var(--text-mid)",marginTop:2 }}>
+                      {s.composer && <span style={{fontStyle:"italic"}}>{s.composer}{s.piece ? " — " : ""}</span>}
+                      {s.piece && <span>{s.piece}</span>}
+                    </div>
+                  )}
                   <div className="session-tags">{(s.tags||[]).map(t=><span key={t} className="tag">{t}</span>)}</div>
+                  {(s.linkedGoals||[]).length > 0 && (
+                    <div style={{display:"flex",flexWrap:"wrap",gap:3,marginTop:3}}>
+                      {(s.linkedGoals||[]).map(gid => {
+                        const g = goals.find(x=>x.id===gid);
+                        return g ? <span key={gid} style={{background:"#fff0e8",color:"var(--rust)",padding:"1px 7px",borderRadius:20,fontSize:".7rem",fontWeight:700,border:"1px solid #f5d5c5"}}>🎯 {g.label}</span> : null;
+                      })}
+                    </div>
+                  )}
+                  {s.linkedPiece && (()=>{ const p=pieces.find(x=>x.id===s.linkedPiece); return p ? <div style={{marginTop:3}}><span style={{background:"#eef4ec",color:"var(--sage)",padding:"1px 7px",borderRadius:20,fontSize:".7rem",fontWeight:700,border:"1px solid #c5d9bf"}}>🎼 {p.title}</span></div> : null; })()}
                   {s.notes && <div style={{ fontSize:".76rem",color:"var(--text-light)",marginTop:2,fontStyle:"italic" }}>{s.notes.slice(0,80)}{s.notes.length>80?"…":""}</div>}
                 </div>
                 <div style={{ display:"flex",gap:4,flexShrink:0 }}>
@@ -597,17 +962,45 @@ function Goals({ goals, setGoals, sessions, unit }) {
   const [form, setForm] = useState({ label:"",type:"weekly_minutes",target:"" });
   const [saved, setSaved] = useState(false);
   const week = weekDates();
-  const thisWeekMins = sessions.filter(s=>week.includes(s.date)).reduce((a,s)=>a+(s.duration||0),0);
   const totalSessions = sessions.length;
 
+  // For a given goal, sum only sessions explicitly linked to it
+  const linkedMinsForGoal = g => sessions
+    .filter(s => (s.linkedGoals||[]).includes(g.id))
+    .reduce((a,s) => a+(s.duration||0), 0);
+
+  // Weekly_minutes goals: count linked sessions within this week only
+  const linkedWeekMinsForGoal = g => sessions
+    .filter(s => (s.linkedGoals||[]).includes(g.id) && week.includes(s.date))
+    .reduce((a,s) => a+(s.duration||0), 0);
+
+  // Total_sessions goals: count linked sessions
+  const linkedSessionsForGoal = g => sessions
+    .filter(s => (s.linkedGoals||[]).includes(g.id)).length;
+
+  const hasAnyLinks = g => sessions.some(s => (s.linkedGoals||[]).includes(g.id));
+
   const getProgress = g => {
-    if (g.type==="weekly_minutes") return Math.min(100,Math.round((thisWeekMins/g.target)*100));
-    if (g.type==="total_sessions") return Math.min(100,Math.round((totalSessions/g.target)*100));
+    if (g.type==="weekly_minutes") {
+      if (!hasAnyLinks(g)) return 0;
+      return Math.min(100, Math.round((linkedWeekMinsForGoal(g)/g.target)*100));
+    }
+    if (g.type==="total_sessions") {
+      if (!hasAnyLinks(g)) return 0;
+      return Math.min(100, Math.round((linkedSessionsForGoal(g)/g.target)*100));
+    }
     return g.progress||0;
   };
+
   const getProgressVal = g => {
-    if (g.type==="weekly_minutes") return `${toDisplay(thisWeekMins,unit)}${unitLabel(unit)} / ${toDisplay(g.target,unit)}${unitLabel(unit)}`;
-    if (g.type==="total_sessions") return `${totalSessions} / ${g.target} sessions`;
+    if (g.type==="weekly_minutes") {
+      const mins = hasAnyLinks(g) ? linkedWeekMinsForGoal(g) : 0;
+      return `${toDisplay(mins,unit)}${unitLabel(unit)} / ${toDisplay(g.target,unit)}${unitLabel(unit)}${hasAnyLinks(g)?" (linked)":""}`;
+    }
+    if (g.type==="total_sessions") {
+      const count = hasAnyLinks(g) ? linkedSessionsForGoal(g) : 0;
+      return `${count} / ${g.target} sessions${hasAnyLinks(g)?" (linked)":""}`;
+    }
     return `${g.progress||0}%`;
   };
 
@@ -823,32 +1216,128 @@ function Stats({ sessions, unit }) {
 
 
 // ── REMINDERS ─────────────────────────────────────────────────────────────────
-function Reminders({ reminders, setReminders }) {
-  const [form, setForm] = useState({ label:"Daily practice", time:"09:00", days:[1,2,3,4,5], enabled:true });
+function Reminders({ reminders, setReminders, focusAreas }) {
+  const [form, setForm] = useState({ label: focusAreas[0]||"Scales", time:"09:00", days:[1,2,3,4,5], enabled:true });
+  const [labelMode, setLabelMode] = useState("preset");
+  const [customLabel, setCustomLabel] = useState("");
   const [saved, setSaved] = useState(false);
-  const [permState, setPermState] = useState(typeof Notification !== "undefined" ? Notification.permission : "default");
-  const dayNames=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+  const [permState, setPermState] = useState("unknown"); // unknown | granted | denied
+  const dayNames = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+  const focusOptions = [...focusAreas, "Custom…"];
 
-  const toggleDay = d => setForm(f=>({...f,days:f.days.includes(d)?f.days.filter(x=>x!==d):[...f.days,d].sort()}));
+  // Check permission on mount
+  useEffect(() => {
+    (async () => {
+      if (isCapacitor()) {
+        try {
+          const { LocalNotifications } = await import("@capacitor/local-notifications");
+          const status = await LocalNotifications.checkPermissions();
+          setPermState(status.display === "granted" ? "granted" : "default");
+        } catch { setPermState("default"); }
+      } else {
+        if (typeof Notification !== "undefined") {
+          setPermState(Notification.permission);
+        } else {
+          setPermState("unsupported");
+        }
+      }
+    })();
+  }, []);
 
   const requestPerm = async () => {
-    if (!("Notification" in window)) { alert("Notifications not supported in this browser."); return; }
-    const r = await Notification.requestPermission(); setPermState(r);
+    if (isCapacitor()) {
+      try {
+        const { LocalNotifications } = await import("@capacitor/local-notifications");
+        const result = await LocalNotifications.requestPermissions();
+        setPermState(result.display === "granted" ? "granted" : "denied");
+      } catch { setPermState("denied"); }
+    } else {
+      if (typeof Notification === "undefined") { setPermState("unsupported"); return; }
+      const r = await Notification.requestPermission();
+      setPermState(r);
+    }
+  };
+
+  const handleLabelSelect = val => {
+    if (val === "Custom…") { setLabelMode("custom"); setForm(f=>({...f,label:customLabel})); }
+    else { setLabelMode("preset"); setForm(f=>({...f,label:val})); }
+  };
+
+  const effectiveLabel = labelMode === "custom" ? customLabel : form.label;
+  const toggleDay = d => setForm(f=>({...f,days:f.days.includes(d)?f.days.filter(x=>x!==d):[...f.days,d].sort()}));
+
+  // Schedule Capacitor local notifications for a reminder
+  const scheduleCapacitorReminder = async (reminder) => {
+    try {
+      const { LocalNotifications } = await import("@capacitor/local-notifications");
+      // Cancel existing notifications for this reminder first
+      const existingIds = reminder.days.map((d, i) => ({ id: reminder.id + i }));
+      await LocalNotifications.cancel({ notifications: existingIds }).catch(()=>{});
+
+      if (!reminder.enabled) return;
+
+      const [hours, minutes] = reminder.time.split(":").map(Number);
+      const notifications = reminder.days.map((dayOfWeek, i) => {
+        // Find next occurrence of this day
+        const now = new Date();
+        const next = new Date();
+        next.setHours(hours, minutes, 0, 0);
+        const daysUntil = (dayOfWeek - now.getDay() + 7) % 7;
+        if (daysUntil === 0 && next <= now) next.setDate(next.getDate() + 7);
+        else next.setDate(next.getDate() + daysUntil);
+
+        return {
+          id: reminder.id + i,
+          title: "🎻 Practice Reminder",
+          body: reminder.label,
+          schedule: {
+            at: next,
+            repeats: true,
+            every: "week",
+          },
+          sound: null,
+          smallIcon: "ic_stat_icon_config_sample",
+        };
+      });
+      await LocalNotifications.schedule({ notifications });
+    } catch (e) { console.error("Scheduling failed", e); }
   };
 
   const addReminder = async () => {
-    if (!form.label||form.days.length===0) return;
-    const updated = [{ ...form, id: Date.now() }, ...reminders];
+    if (!effectiveLabel || form.days.length===0) return;
+    const newReminder = { ...form, label: effectiveLabel, id: Date.now() };
+    const updated = [newReminder, ...reminders];
     setReminders(updated); await sSet(SK.reminders, updated);
-    setForm({ label:"Daily practice",time:"09:00",days:[1,2,3,4,5],enabled:true });
-    setSaved(true); setTimeout(()=>setSaved(false),2000);
+    if (isCapacitor() && permState === "granted") await scheduleCapacitorReminder(newReminder);
+    setForm({ label: focusAreas[0]||"Scales", time:"09:00", days:[1,2,3,4,5], enabled:true });
+    setLabelMode("preset"); setCustomLabel("");
+    setSaved(true); setTimeout(()=>setSaved(false), 2000);
   };
 
-  const toggleEnabled = async (id) => { const u=reminders.map(r=>r.id===id?{...r,enabled:!r.enabled}:r); setReminders(u); await sSet(SK.reminders,u); };
-  const deleteReminder = async (id) => { const u=reminders.filter(r=>r.id!==id); setReminders(u); await sSet(SK.reminders,u); };
+  const toggleEnabled = async (id) => {
+    const updated = reminders.map(r => r.id===id ? {...r, enabled:!r.enabled} : r);
+    setReminders(updated); await sSet(SK.reminders, updated);
+    if (isCapacitor()) {
+      const r = updated.find(x => x.id===id);
+      if (r) await scheduleCapacitorReminder(r);
+    }
+  };
 
+  const deleteReminder = async (id) => {
+    if (isCapacitor()) {
+      try {
+        const { LocalNotifications } = await import("@capacitor/local-notifications");
+        const r = reminders.find(x => x.id===id);
+        if (r) await LocalNotifications.cancel({ notifications: r.days.map((_,i)=>({ id: r.id+i })) });
+      } catch {}
+    }
+    const updated = reminders.filter(r => r.id!==id);
+    setReminders(updated); await sSet(SK.reminders, updated);
+  };
+
+  // Web-only: poll every minute and fire browser notifications
   useEffect(() => {
-    if (permState !== "granted") return;
+    if (isCapacitor() || permState !== "granted") return;
     const check = () => {
       const now = new Date();
       const hhmm = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}`;
@@ -859,19 +1348,38 @@ function Reminders({ reminders, setReminders }) {
     return () => clearInterval(iv);
   }, [reminders, permState]);
 
+  const permGranted = permState === "granted";
+  const permDenied = permState === "denied";
+  const permUnsupported = permState === "unsupported";
+
   return (
     <div className="grid2">
       <div className="card">
         <div className="card-title">🔔 Add Reminder</div>
-        {permState !== "granted" && (
+
+        {!permGranted && !permDenied && !permUnsupported && (
           <div style={{background:"var(--warm1)",borderRadius:9,padding:"11px 13px",marginBottom:14,fontSize:".83rem",color:"var(--text-mid)"}}>
-            <strong>Enable notifications</strong> to receive practice reminders while this tab is open.
+            <strong>Enable notifications</strong> to receive practice reminders.
+            {!isCapacitor() && <span> Reminders fire while this tab is open.</span>}
             <br/><button className="btn btn-primary btn-sm" style={{marginTop:8}} onClick={requestPerm}>Enable Notifications</button>
           </div>
         )}
-        {permState==="granted"&&<div style={{background:"#d9f0e4",borderRadius:9,padding:"8px 12px",marginBottom:14,fontSize:".8rem",color:"#2e7d52",fontWeight:700}}>✓ Notifications enabled</div>}
-        {permState==="denied"&&<div style={{background:"#fde9d9",borderRadius:9,padding:"8px 12px",marginBottom:14,fontSize:".8rem",color:"var(--rust)",fontWeight:700}}>⚠ Notifications blocked. Please enable them in your browser settings.</div>}
-        <div className="field"><label>Label</label><input placeholder="e.g. Morning practice session" value={form.label} onChange={e=>setForm(f=>({...f,label:e.target.value}))} /></div>
+        {permGranted && <div style={{background:"#d9f0e4",borderRadius:9,padding:"8px 12px",marginBottom:14,fontSize:".8rem",color:"#2e7d52",fontWeight:700}}>✓ Notifications enabled</div>}
+        {permDenied && <div style={{background:"#fde9d9",borderRadius:9,padding:"8px 12px",marginBottom:14,fontSize:".8rem",color:"var(--rust)",fontWeight:700}}>⚠ Notifications blocked. Please enable them in your {isCapacitor()?"Android app settings":"browser settings"}.</div>}
+        {permUnsupported && <div style={{background:"#fde9d9",borderRadius:9,padding:"8px 12px",marginBottom:14,fontSize:".8rem",color:"var(--rust)",fontWeight:700}}>⚠ Notifications not supported in this environment.</div>}
+
+        <div className="field">
+          <label>Focus Area</label>
+          <select value={labelMode==="custom"?"Custom…":form.label} onChange={e=>handleLabelSelect(e.target.value)}>
+            {focusOptions.map(o=><option key={o} value={o}>{o}</option>)}
+          </select>
+        </div>
+        {labelMode==="custom"&&(
+          <div className="field">
+            <label>Custom Label</label>
+            <input placeholder="e.g. Morning warm-up routine" value={customLabel} onChange={e=>setCustomLabel(e.target.value)} autoFocus />
+          </div>
+        )}
         <div className="field"><label>Time</label><input type="time" value={form.time} onChange={e=>setForm(f=>({...f,time:e.target.value}))} /></div>
         <div className="field">
           <label>Days</label>
@@ -883,7 +1391,9 @@ function Reminders({ reminders, setReminders }) {
           </div>
         </div>
         <button className="btn btn-primary" onClick={addReminder} style={{width:"100%"}}>{saved?"✓ Saved!":"Add Reminder"}</button>
-        <p style={{fontSize:".74rem",color:"var(--text-light)",marginTop:10,lineHeight:1.5}}>Reminders fire while this tab is open. Tip: pin this tab in your browser for reliable reminders.</p>
+        <p style={{fontSize:".74rem",color:"var(--text-light)",marginTop:10,lineHeight:1.5}}>
+          {isCapacitor() ? "Reminders will fire even when the app is closed." : "Reminders fire while this tab is open. Tip: pin this tab for reliable reminders."}
+        </p>
       </div>
       <div className="card">
         <div className="card-title">📋 My Reminders</div>
@@ -905,17 +1415,92 @@ function Reminders({ reminders, setReminders }) {
 }
 
 // ── EXPORT ────────────────────────────────────────────────────────────────────
+const isCapacitor = () => typeof window !== "undefined" && !!(window.Capacitor?.isNativePlatform?.());
+
 function Export({ sessions, pieces, goals, unit }) {
-  const exportCSV = () => {
-    const rows = [["Date","Duration","Piece/Focus","Rating","Tags","Notes"]];
-    sessions.forEach(s => rows.push([s.date,`${toDisplay(s.duration,unit)}${unitLabel(unit)}`,s.piece||"",s.rating||"",(s.tags||[]).join(";"),(s.notes||"").replace(/"/g,"'")]));
-    const csv = rows.map(r=>r.map(c=>`"${c}"`).join(",")).join("\n");
-    const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv],{type:"text/csv"})); a.download="violin_practice_log.csv"; a.click();
+  const [pdfStatus, setPdfStatus] = useState("idle");
+  const [pkgName, setPkgName] = useState("");
+  const [pkgTutorName, setPkgTutorName] = useState("");
+  const [pkgDescription, setPkgDescription] = useState("");
+  const [pkgGoals, setPkgGoals] = useState([]);
+  const [pkgPieces, setPkgPieces] = useState([]);
+  const [pkgFocusAreas, setPkgFocusAreas] = useState([]);
+  const [generatedLink, setGeneratedLink] = useState("");
+  const [copied, setCopied] = useState(false);
+
+  const togglePkgFocus = fa => setPkgFocusAreas(f => f.includes(fa) ? f.filter(x=>x!==fa) : [...f, fa]);
+
+  // For ticking existing goals/pieces to include
+  const togglePkgGoal = id => setPkgGoals(g => g.includes(id) ? g.filter(x=>x!==id) : [...g, id]);
+  const togglePkgPiece = id => setPkgPieces(p => p.includes(id) ? p.filter(x=>x!==id) : [...p, id]);
+
+  // For adding new goals/pieces from scratch in the package builder
+  const [newPkgGoalLabel, setNewPkgGoalLabel] = useState("");
+  const [newPkgGoalType, setNewPkgGoalType] = useState("weekly_minutes");
+  const [newPkgGoalTarget, setNewPkgGoalTarget] = useState("");
+  const [pkgGoalItems, setPkgGoalItems] = useState([]); // custom-built goals for package
+  const [newPkgPieceTitle, setNewPkgPieceTitle] = useState("");
+  const [newPkgPieceComposer, setNewPkgPieceComposer] = useState("");
+  const [newPkgPieceStatus, setNewPkgPieceStatus] = useState("learning");
+  const [pkgPieceItems, setPkgPieceItems] = useState([]); // custom-built pieces for package
+  const [newPkgFocus, setNewPkgFocus] = useState("");
+  const [pkgFocusItems, setPkgFocusItems] = useState([]); // custom-built focus areas for package
+
+  const addPkgGoal = () => {
+    if (!newPkgGoalLabel.trim() || !newPkgGoalTarget) return;
+    const targetVal = newPkgGoalType === "weekly_minutes" ? toMins(Number(newPkgGoalTarget), unit) : Number(newPkgGoalTarget);
+    setPkgGoalItems(g => [...g, { id: Date.now(), label: newPkgGoalLabel.trim(), type: newPkgGoalType, target: targetVal }]);
+    setNewPkgGoalLabel(""); setNewPkgGoalTarget("");
+  };
+  const removePkgGoal = id => setPkgGoalItems(g => g.filter(x => x.id !== id));
+
+  const addPkgPiece = () => {
+    if (!newPkgPieceTitle.trim()) return;
+    setPkgPieceItems(p => [...p, { id: Date.now(), title: newPkgPieceTitle.trim(), composer: newPkgPieceComposer.trim(), status: newPkgPieceStatus }]);
+    setNewPkgPieceTitle(""); setNewPkgPieceComposer("");
+  };
+  const removePkgPiece = id => setPkgPieceItems(p => p.filter(x => x.id !== id));
+
+  const addPkgFocusItem = () => {
+    if (!newPkgFocus.trim() || pkgFocusItems.includes(newPkgFocus.trim())) return;
+    setPkgFocusItems(f => [...f, newPkgFocus.trim()]); setNewPkgFocus("");
+  };
+  const removePkgFocus = fa => setPkgFocusItems(f => f.filter(x => x !== fa));
+
+  // Also allow ticking existing goals/pieces from the user's own data
+  const linkableGoals = goals.filter(g => g.type !== "custom");
+  const allFocusAreas = [...new Set(sessions.flatMap(s => s.tags||[]))];
+
+  const APP_URL = "https://violin-journal-app.vercel.app";
+
+  const generateLink = () => {
+    // Combine custom-built items with any ticked existing ones
+    const tickedGoals = linkableGoals.filter(g => pkgGoals.includes(g.id)).map(g => ({ label: g.label, type: g.type, target: g.target }));
+    const tickedPieces = pieces.filter(p => pkgPieces.includes(p.id)).map(p => ({ title: p.title, composer: p.composer||"", status: p.status, difficulty: p.difficulty, notes: p.notes||"" }));
+    const allGoals = [...pkgGoalItems.map(g => ({ label: g.label, type: g.type, target: g.target })), ...tickedGoals];
+    const allPieces = [...pkgPieceItems.map(p => ({ title: p.title, composer: p.composer, status: p.status, difficulty: 0, notes: "" })), ...tickedPieces];
+    const allFocus = [...pkgFocusItems, ...pkgFocusAreas];
+    const pkg = {
+      type: "practice_package",
+      name: pkgName || "Practice Package",
+      tutorName: pkgTutorName,
+      description: pkgDescription,
+      goals: allGoals,
+      pieces: allPieces,
+      focusAreas: [...new Set(allFocus)],
+      created: todayStr(),
+    };
+    const encoded = btoa(JSON.stringify(pkg));
+    setGeneratedLink(`${APP_URL}/?pkg=${encoded}`);
   };
 
-  const exportPDF = () => {
+  const copyLink = async () => {
+    try { await navigator.clipboard.writeText(generatedLink); setCopied(true); setTimeout(()=>setCopied(false), 2500); } catch {}
+  };
+
+  const buildHTMLReport = () => {
     const totalMins = sessions.reduce((a,s)=>a+(s.duration||0),0);
-    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Violin Practice Log</title>
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Violin Practice Log</title>
 <style>
 body{font-family:Georgia,serif;max-width:780px;margin:40px auto;color:#2c1a0e;padding:0 24px;}
 h1{color:#5c3d1e;border-bottom:2px solid #b5541c;padding-bottom:8px;font-size:1.8rem;}
@@ -940,62 +1525,356 @@ tr:nth-child(even){background:#faf6ef;}
 <div class="stat"><div class="stat-num">${goals.length}</div><div class="stat-label">Active Goals</div></div>
 </div>
 <h2>Practice Log</h2>
-<table><thead><tr><th>Date</th><th>Duration</th><th>Piece / Focus</th><th>Rating</th><th>Tags</th><th>Notes</th></tr></thead>
-<tbody>${sessions.map(s=>`<tr><td>${s.date}</td><td>${toDisplay(s.duration,unit)}${unitLabel(unit)}</td><td>${s.piece||""}</td><td>${"★".repeat(s.rating||0)}</td><td>${(s.tags||[]).join(", ")}</td><td>${s.notes||""}</td></tr>`).join("")}</tbody></table>
+<table><thead><tr><th>Date</th><th>Duration</th><th>Composer</th><th>Piece / Focus</th><th>Rating</th><th>Tags</th><th>Notes</th></tr></thead>
+<tbody>${sessions.map(s=>`<tr><td>${s.date}</td><td>${toDisplay(s.duration,unit)}${unitLabel(unit)}</td><td>${s.composer||""}</td><td>${s.piece||""}</td><td>${"★".repeat(s.rating||0)}</td><td>${(s.tags||[]).join(", ")}</td><td>${s.notes||""}</td></tr>`).join("")}</tbody></table>
 <h2>Repertoire</h2>
 <table><thead><tr><th>Title</th><th>Composer</th><th>Status</th><th>Difficulty</th><th>Last Practiced</th><th>Notes</th></tr></thead>
 <tbody>${pieces.map(p=>`<tr><td>${p.title}</td><td>${p.composer||""}</td><td>${p.status}</td><td>${"★".repeat(p.difficulty||0)}</td><td>${p.lastPracticed||"—"}</td><td>${p.notes||""}</td></tr>`).join("")}</tbody></table>
 <div class="footer">Generated by Violin Practice Journal</div>
 </body></html>`;
-    const w = window.open("","_blank"); if (w) { w.document.write(html); w.document.close(); setTimeout(()=>w.print(),600); }
   };
 
+  const exportCSV = () => {
+    const rows = [["Date","Duration","Composer","Piece/Focus","Rating","Tags","Notes"]];
+    sessions.forEach(s => rows.push([s.date,`${toDisplay(s.duration,unit)}${unitLabel(unit)}`,s.composer||"",s.piece||"",s.rating||"",(s.tags||[]).join(";"),(s.notes||"").replace(/"/g,"'")]));
+    const csv = rows.map(r=>r.map(c=>`"${c}"`).join(",")).join("\n");
+    const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv],{type:"text/csv"})); a.download="violin_practice_log.csv"; a.click();
+  };
+
+  const exportPDF = async () => {
+    const html = buildHTMLReport();
+    if (isCapacitor()) {
+      try {
+        setPdfStatus("generating");
+        const { Filesystem, Directory, Encoding } = await import("@capacitor/filesystem");
+        const { Share } = await import("@capacitor/share");
+        const fileName = `violin_practice_${new Date().toISOString().slice(0,10)}.html`;
+        await Filesystem.writeFile({ path: fileName, data: html, directory: Directory.Cache, encoding: Encoding.UTF8 });
+        const fileResult = await Filesystem.getUri({ path: fileName, directory: Directory.Cache });
+        await Share.share({ title: "Violin Practice Journal", text: "My violin practice report", url: fileResult.uri, dialogTitle: "Save or share your practice report" });
+        setPdfStatus("done"); setTimeout(() => setPdfStatus("idle"), 3000);
+      } catch (e) { console.error(e); setPdfStatus("error"); setTimeout(() => setPdfStatus("idle"), 3000); }
+    } else {
+      const w = window.open("","_blank");
+      if (w) { w.document.write(html); w.document.close(); setTimeout(()=>w.print(),600); }
+    }
+  };
+
+  const pdfLabel = pdfStatus==="generating" ? "⏳ Generating…" : pdfStatus==="done" ? "✓ Saved!" : pdfStatus==="error" ? "⚠ Error" : isCapacitor() ? "📤 Share / Save" : "🖨 PDF";
+
   return (
-    <div style={{maxWidth:520,margin:"0 auto"}}>
+    <>
+      {/* Create Practice Package */}
+      <div className="card">
+        <div className="card-title">📦 Create Practice Package</div>
+        <div style={{fontSize:".83rem",color:"var(--text-mid)",marginBottom:14,lineHeight:1.55}}>
+          Build a shareable link for your students containing goals, pieces, and focus areas.
+        </div>
+        <div className="field"><label>Package Name</label><input placeholder="e.g. Week 3 Beginner Routine" value={pkgName} onChange={e=>setPkgName(e.target.value)} /></div>
+        <div className="field"><label>Your Name (Tutor)</label><input placeholder="e.g. Mr. Smith" value={pkgTutorName} onChange={e=>setPkgTutorName(e.target.value)} /></div>
+        <div className="field"><label>Description / Notes for Student</label><textarea rows={2} placeholder="e.g. Focus on bow hold this week. Practice slowly!" value={pkgDescription} onChange={e=>setPkgDescription(e.target.value)} /></div>
+
+        {/* Goals */}
+        <div className="field">
+          <label>Goals to Include</label>
+          {pkgGoalItems.map(g => (
+            <div key={g.id} style={{display:"flex",alignItems:"center",gap:6,marginBottom:5,padding:"5px 8px",background:"var(--cream)",borderRadius:7,border:"1px solid var(--warm2)"}}>
+              <span style={{flex:1,fontSize:".82rem",fontWeight:700}}>{g.label}</span>
+              <span style={{fontSize:".74rem",color:"var(--text-light)"}}>{toDisplay(g.target,unit)}{unitLabel(unit)}</span>
+              <button onClick={()=>removePkgGoal(g.id)} style={{background:"none",border:"none",color:"var(--rust)",cursor:"pointer",fontWeight:900,fontSize:".9rem"}}>✕</button>
+            </div>
+          ))}
+          {/* Also tick existing goals */}
+          {linkableGoals.length > 0 && linkableGoals.map(g => {
+            const on = pkgGoals.includes(g.id);
+            return (
+              <div key={g.id} onClick={()=>togglePkgGoal(g.id)} style={{display:"flex",alignItems:"center",gap:8,marginBottom:5,padding:"5px 8px",background:on?"#fff5f0":"var(--cream)",borderRadius:7,border:`1.5px solid ${on?"var(--rust)":"var(--warm2)"}`,cursor:"pointer"}}>
+                <div style={{width:14,height:14,borderRadius:3,border:`2px solid ${on?"var(--rust)":"var(--warm2)"}`,background:on?"var(--rust)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                  {on&&<span style={{color:"white",fontSize:".55rem",fontWeight:900}}>✓</span>}
+                </div>
+                <span style={{flex:1,fontSize:".82rem"}}>{g.label}</span>
+                <span style={{fontSize:".74rem",color:"var(--text-light)"}}>{toDisplay(g.target,unit)}{unitLabel(unit)}</span>
+              </div>
+            );
+          })}
+          <div style={{display:"flex",flexDirection:"column",gap:5,marginTop:6,padding:"10px",background:"var(--warm1)",borderRadius:8}}>
+            <div style={{fontSize:".74rem",fontWeight:700,color:"var(--text-mid)",marginBottom:2}}>Add a goal</div>
+            <input placeholder="Goal label, e.g. Daily scales" value={newPkgGoalLabel} onChange={e=>setNewPkgGoalLabel(e.target.value)} style={{fontSize:".82rem"}} />
+            <div style={{display:"flex",gap:6}}>
+              <select value={newPkgGoalType} onChange={e=>setNewPkgGoalType(e.target.value)} style={{flex:1,fontSize:".8rem"}}>
+                <option value="weekly_minutes">Weekly minutes</option>
+                <option value="total_sessions">Total sessions</option>
+              </select>
+              <input placeholder={newPkgGoalType==="weekly_minutes"?"mins/week":"sessions"} value={newPkgGoalTarget} onChange={e=>setNewPkgGoalTarget(e.target.value)} type="number" style={{width:90,fontSize:".82rem"}} />
+              <button className="btn btn-primary btn-sm" onClick={addPkgGoal}>+ Add</button>
+            </div>
+          </div>
+        </div>
+
+        {/* Pieces */}
+        <div className="field">
+          <label>Pieces to Include</label>
+          {pkgPieceItems.map(p => (
+            <div key={p.id} style={{display:"flex",alignItems:"center",gap:6,marginBottom:5,padding:"5px 8px",background:"var(--cream)",borderRadius:7,border:"1px solid var(--warm2)"}}>
+              <span style={{flex:1,fontSize:".82rem",fontWeight:700}}>{p.title}</span>
+              {p.composer&&<span style={{fontSize:".74rem",color:"var(--text-light)",fontStyle:"italic"}}>{p.composer}</span>}
+              <button onClick={()=>removePkgPiece(p.id)} style={{background:"none",border:"none",color:"var(--rust)",cursor:"pointer",fontWeight:900,fontSize:".9rem"}}>✕</button>
+            </div>
+          ))}
+          {/* Also tick existing pieces */}
+          {pieces.length > 0 && pieces.map(p => {
+            const on = pkgPieces.includes(p.id);
+            return (
+              <div key={p.id} onClick={()=>togglePkgPiece(p.id)} style={{display:"flex",alignItems:"center",gap:8,marginBottom:5,padding:"5px 8px",background:on?"#fff5f0":"var(--cream)",borderRadius:7,border:`1.5px solid ${on?"var(--rust)":"var(--warm2)"}`,cursor:"pointer"}}>
+                <div style={{width:14,height:14,borderRadius:3,border:`2px solid ${on?"var(--rust)":"var(--warm2)"}`,background:on?"var(--rust)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                  {on&&<span style={{color:"white",fontSize:".55rem",fontWeight:900}}>✓</span>}
+                </div>
+                <span style={{flex:1,fontSize:".82rem"}}>{p.title}</span>
+                {p.composer&&<span style={{fontSize:".74rem",color:"var(--text-light)",fontStyle:"italic"}}>{p.composer}</span>}
+              </div>
+            );
+          })}
+          <div style={{display:"flex",flexDirection:"column",gap:5,marginTop:6,padding:"10px",background:"var(--warm1)",borderRadius:8}}>
+            <div style={{fontSize:".74rem",fontWeight:700,color:"var(--text-mid)",marginBottom:2}}>Add a piece</div>
+            <input placeholder="Piece title, e.g. Violin Concerto in A minor" value={newPkgPieceTitle} onChange={e=>setNewPkgPieceTitle(e.target.value)} style={{fontSize:".82rem"}} onKeyDown={e=>e.key==="Enter"&&addPkgPiece()} />
+            <div style={{display:"flex",gap:6}}>
+              <input placeholder="Composer (optional)" value={newPkgPieceComposer} onChange={e=>setNewPkgPieceComposer(e.target.value)} style={{flex:1,fontSize:".82rem"}} />
+              <select value={newPkgPieceStatus} onChange={e=>setNewPkgPieceStatus(e.target.value)} style={{fontSize:".8rem"}}>
+                <option value="wishlist">Wishlist</option>
+                <option value="learning">Learning</option>
+                <option value="polishing">Polishing</option>
+                <option value="ready">Ready</option>
+              </select>
+              <button className="btn btn-primary btn-sm" onClick={addPkgPiece}>+ Add</button>
+            </div>
+          </div>
+        </div>
+
+        {/* Focus Areas */}
+        <div className="field">
+          <label>Focus Areas to Include</label>
+          <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:6}}>
+            {pkgFocusItems.map(fa => (
+              <span key={fa} style={{display:"flex",alignItems:"center",gap:4,padding:"4px 10px",borderRadius:20,background:"var(--rust)",color:"white",fontSize:".8rem",fontWeight:700}}>
+                {fa}<button onClick={()=>removePkgFocus(fa)} style={{background:"none",border:"none",color:"white",cursor:"pointer",fontWeight:900,marginLeft:2,fontSize:".85rem"}}>✕</button>
+              </span>
+            ))}
+          </div>
+          <div style={{display:"flex",gap:6}}>
+            <input placeholder="e.g. Bow technique" value={newPkgFocus} onChange={e=>setNewPkgFocus(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addPkgFocusItem()} style={{flex:1,fontSize:".82rem"}} />
+            <button className="btn btn-primary btn-sm" onClick={addPkgFocusItem}>+ Add</button>
+          </div>
+        </div>
+
+        <button className="btn btn-primary" style={{width:"100%",marginBottom:generatedLink?10:0}} onClick={generateLink}>🔗 Generate Share Link</button>
+
+        {generatedLink && (
+          <div style={{background:"var(--cream)",border:"1.5px solid var(--warm2)",borderRadius:9,padding:"10px 12px"}}>
+            <div style={{fontSize:".74rem",color:"var(--text-light)",marginBottom:5,fontWeight:700,textTransform:"uppercase",letterSpacing:".05em"}}>Share this link with your student</div>
+            <div style={{fontSize:".75rem",color:"var(--text-mid)",wordBreak:"break-all",marginBottom:8,fontFamily:"monospace",background:"white",padding:"6px 8px",borderRadius:6,border:"1px solid var(--warm2)"}}>{generatedLink}</div>
+            <button className="btn btn-primary btn-sm" onClick={copyLink} style={{width:"100%"}}>{copied ? "✓ Copied!" : "📋 Copy Link"}</button>
+          </div>
+        )}
+      </div>
+
+      {/* Export Data */}
       <div className="card">
         <div className="card-title">📤 Export Practice Data</div>
         <p style={{fontSize:".85rem",color:"var(--text-mid)",marginBottom:20,lineHeight:1.55}}>Export your practice log to share with your teacher or keep as a backup.</p>
         <div style={{display:"flex",flexDirection:"column",gap:12}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 16px",background:"var(--cream)",borderRadius:10,border:"1px solid var(--warm2)"}}>
-            <div>
-              <div style={{fontWeight:700}}>CSV Spreadsheet</div>
-              <div style={{fontSize:".78rem",color:"var(--text-light)",marginTop:2}}>Open in Excel, Sheets, or Numbers. {sessions.length} sessions.</div>
-            </div>
+            <div><div style={{fontWeight:700}}>CSV Spreadsheet</div><div style={{fontSize:".78rem",color:"var(--text-light)",marginTop:2}}>Open in Excel, Sheets, or Numbers. {sessions.length} sessions.</div></div>
             <button className="btn btn-primary" onClick={exportCSV}>⬇ CSV</button>
           </div>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 16px",background:"var(--cream)",borderRadius:10,border:"1px solid var(--warm2)"}}>
-            <div>
-              <div style={{fontWeight:700}}>PDF / Print Report</div>
-              <div style={{fontSize:".78rem",color:"var(--text-light)",marginTop:2}}>Formatted report with stats, full log and repertoire.</div>
-            </div>
-            <button className="btn btn-ghost" onClick={exportPDF}>🖨 PDF</button>
+            <div><div style={{fontWeight:700}}>{isCapacitor() ? "Share / Save Report" : "PDF / Print Report"}</div><div style={{fontSize:".78rem",color:"var(--text-light)",marginTop:2}}>{isCapacitor() ? "Opens native share sheet — save as PDF, email, or share." : "Formatted report with stats, full log and repertoire."}</div></div>
+            <button className="btn btn-ghost" onClick={exportPDF} disabled={pdfStatus==="generating"}>{pdfLabel}</button>
           </div>
         </div>
         <div style={{marginTop:18,padding:"11px 14px",background:"var(--warm1)",borderRadius:9,fontSize:".8rem",color:"var(--text-mid)"}}>
-          💡 <strong>Tip:</strong> Share the PDF with your violin teacher before each lesson.
+          💡 <strong>Tip:</strong> Share the report with your violin teacher before each lesson.
         </div>
       </div>
-    </div>
+    </>
   );
 }
 
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
-function Settings({ sessions, setSessions, pieces, setPieces, goals, setGoals, reminders, setReminders }) {
+function Settings({ sessions, setSessions, pieces, setPieces, goals, setGoals, reminders, setReminders, focusAreas, setFocusAreas, unit, incomingPkg, setIncomingPkg }) {
   const [confirm, setConfirm] = useState(null);
+  const [newArea, setNewArea] = useState("");
+  const [selected, setSelected] = useState(new Set());
+  const [importLink, setImportLink] = useState("");
+  const [importPreview, setImportPreview] = useState(incomingPkg || null);
+  const [importError, setImportError] = useState("");
+  const [importDone, setImportDone] = useState(false);
+
+  // Auto-show incoming package from URL on first render
+  useEffect(() => {
+    if (incomingPkg) { setImportPreview(incomingPkg); setIncomingPkg(null); }
+  }, []);
+
   const resetSessions = async () => { setSessions([]); await sSet(SK.sessions,[]); setConfirm(null); };
   const resetPieces = async () => { setPieces([]); await sSet(SK.pieces,[]); setConfirm(null); };
   const resetGoals = async () => { setGoals([]); await sSet(SK.goals,[]); setConfirm(null); };
   const resetAll = async () => { setSessions([]); setPieces([]); setGoals([]); setReminders([]); await Promise.all([sSet(SK.sessions,[]),sSet(SK.pieces,[]),sSet(SK.goals,[]),sSet(SK.reminders,[])]); setConfirm(null); };
+
+  const toggleSelect = name => setSelected(s => { const n = new Set(s); n.has(name) ? n.delete(name) : n.add(name); return n; });
+
+  const addFocusArea = async () => {
+    const trimmed = newArea.trim();
+    if (!trimmed || focusAreas.includes(trimmed)) return;
+    const updated = [...focusAreas, trimmed];
+    setFocusAreas(updated); await sSet(SK.focusAreas, updated);
+    setNewArea("");
+  };
+
+  const deleteSelected = async () => {
+    const updated = focusAreas.filter(a => !selected.has(a));
+    setFocusAreas(updated); await sSet(SK.focusAreas, updated);
+    setSelected(new Set());
+    setConfirm(null);
+  };
+
+  // Parse a package link or raw base64 string
+  const parseImportLink = (raw) => {
+    setImportError(""); setImportPreview(null); setImportDone(false);
+    try {
+      let encoded = raw.trim();
+      // Extract from URL if it's a full link
+      try {
+        const url = new URL(encoded);
+        encoded = url.searchParams.get("pkg") || encoded;
+      } catch {}
+      const decoded = JSON.parse(atob(encoded));
+      if (!decoded.type === "practice_package") throw new Error("Not a valid package");
+      setImportPreview(decoded);
+    } catch {
+      if (raw.trim()) setImportError("Invalid package link. Please check and try again.");
+    }
+  };
+
+  const applyImport = async () => {
+    if (!importPreview) return;
+    const pkg = importPreview;
+
+    if (pkg.goals?.length) {
+      const fresh = pkg.goals.map(g => ({
+        id: Date.now() + Math.random(),
+        label: g.label,
+        type: g.type,
+        target: g.target,
+        progress: 0,
+        created: todayStr(),
+      }));
+      const newGoals = [...goals, ...fresh];
+      await sSet(SK.goals, newGoals); setGoals(newGoals);
+    }
+    if (pkg.pieces?.length) {
+      const fresh = pkg.pieces.map(p => ({
+        id: Date.now() + Math.random(),
+        title: p.title,
+        composer: p.composer || "",
+        status: p.status || "learning",
+        difficulty: p.difficulty || 0,
+        notes: p.notes || "",
+        lastPracticed: null,
+        added: todayStr(),
+      }));
+      const newPieces = [...pieces, ...fresh];
+      await sSet(SK.pieces, newPieces); setPieces(newPieces);
+    }
+    if (pkg.focusAreas?.length) {
+      const merged = [...new Set([...focusAreas, ...pkg.focusAreas])];
+      await sSet(SK.focusAreas, merged); setFocusAreas(merged);
+    }
+    setImportDone(true); setImportPreview(null); setImportLink("");
+    setTimeout(() => setImportDone(false), 3000);
+  };
+
   const rows = [
     {label:"Practice Logs",sub:`${sessions.length} session(s)`,fn:()=>setConfirm({title:"Clear all practice logs?",body:"All sessions permanently deleted.",action:resetSessions})},
     {label:"Repertoire",sub:`${pieces.length} piece(s)`,fn:()=>setConfirm({title:"Clear repertoire?",body:"All pieces removed.",action:resetPieces})},
     {label:"Goals",sub:`${goals.length} goal(s)`,fn:()=>setConfirm({title:"Clear all goals?",body:"All goals deleted.",action:resetGoals})},
     {label:"Everything",sub:"Wipe all data",danger:true,fn:()=>setConfirm({title:"Reset everything?",body:"All data permanently deleted. Cannot be undone.",action:resetAll})},
   ];
+
   return (
     <>
       {confirm&&<ConfirmModal title={confirm.title} body={confirm.body} onConfirm={confirm.action} onCancel={()=>setConfirm(null)} />}
-      <div style={{maxWidth:520,margin:"0 auto"}}>
+      <div style={{maxWidth:520,margin:"0 auto",display:"flex",flexDirection:"column",gap:16}}>
+
+        {/* Import Practice Package */}
+        <div className="card">
+          <div className="card-title">📥 Import Practice Package</div>
+          <div style={{fontSize:".83rem",color:"var(--text-mid)",marginBottom:14,lineHeight:1.55}}>
+            Paste a practice package link from your tutor to add their recommended goals, pieces, and focus areas.
+          </div>
+          <div style={{display:"flex",gap:8,marginBottom:8}}>
+            <input
+              placeholder="Paste package link here…"
+              value={importLink}
+              onChange={e => { setImportLink(e.target.value); parseImportLink(e.target.value); }}
+              style={{flex:1}}
+            />
+            {importLink && <button className="btn btn-ghost btn-sm" onClick={()=>{ setImportLink(""); setImportPreview(null); setImportError(""); }}>✕</button>}
+          </div>
+          {importError && <div style={{fontSize:".8rem",color:"var(--rust)",marginBottom:8,fontWeight:700}}>⚠ {importError}</div>}
+          {importDone && <div style={{fontSize:".8rem",color:"#2e7d52",fontWeight:700,marginBottom:8}}>✓ Package imported successfully!</div>}
+
+          {importPreview && (
+            <div style={{background:"var(--cream)",border:"1.5px solid var(--warm2)",borderRadius:10,padding:"12px 14px",marginBottom:10}}>
+              <div style={{fontWeight:700,fontSize:".88rem",marginBottom:6,color:"var(--brown)"}}>
+                📦 {importPreview.name || "Practice Package"}
+              </div>
+              {importPreview.tutorName && <div style={{fontSize:".78rem",color:"var(--text-light)",marginBottom:8}}>From: {importPreview.tutorName}</div>}
+              {importPreview.description && <div style={{fontSize:".82rem",color:"var(--text-mid)",marginBottom:10,fontStyle:"italic"}}>{importPreview.description}</div>}
+              <div style={{display:"flex",flexDirection:"column",gap:4,marginBottom:12}}>
+                {importPreview.goals?.length > 0 && <div style={{fontSize:".8rem"}}><span style={{color:"var(--rust)",fontWeight:700}}>🎯 {importPreview.goals.length} goal{importPreview.goals.length>1?"s":""}</span> — {importPreview.goals.map(g=>g.label).join(", ")}</div>}
+                {importPreview.pieces?.length > 0 && <div style={{fontSize:".8rem"}}><span style={{color:"var(--rust)",fontWeight:700}}>🎼 {importPreview.pieces.length} piece{importPreview.pieces.length>1?"s":""}</span> — {importPreview.pieces.map(p=>p.title).join(", ")}</div>}
+                {importPreview.focusAreas?.length > 0 && <div style={{fontSize:".8rem"}}><span style={{color:"var(--rust)",fontWeight:700}}>🏷 {importPreview.focusAreas.length} focus area{importPreview.focusAreas.length>1?"s":""}</span> — {importPreview.focusAreas.join(", ")}</div>}
+              </div>
+              <button className="btn btn-primary" style={{width:"100%"}} onClick={applyImport}>✓ Import Package</button>
+            </div>
+          )}
+        </div>
+
+        {/* Export */}
+        <Export sessions={sessions} pieces={pieces} goals={goals} unit={unit} />
+
+        {/* Focus Areas */}
+        <div className="card">
+          <div className="card-title">🏷 Edit Focus Areas</div>
+          <div style={{fontSize:".8rem",color:"var(--text-light)",marginBottom:12}}>Select areas to delete them, or add new ones below.</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:14}}>
+            {focusAreas.map(a => {
+              const isSelected = selected.has(a);
+              return (
+                <button key={a} onClick={()=>toggleSelect(a)} style={{
+                  padding:"5px 12px", borderRadius:20, fontSize:".82rem", fontWeight:700, cursor:"pointer",
+                  border: `1.5px solid ${isSelected ? "#c0392b" : "var(--warm2)"}`,
+                  background: isSelected ? "#fee" : "var(--cream)",
+                  color: isSelected ? "#c0392b" : "var(--text-mid)",
+                  transition:"all .15s",
+                }}>
+                  {isSelected && <span style={{marginRight:4}}>✕</span>}{a}
+                </button>
+              );
+            })}
+          </div>
+          {selected.size > 0 && (
+            <button className="btn btn-danger btn-sm" style={{marginBottom:14}}
+              onClick={()=>setConfirm({title:`Delete ${selected.size} focus area${selected.size>1?"s":""}?`,body:"This won't affect existing logged sessions, but these areas will no longer appear as options.",action:deleteSelected})}>
+              Delete {selected.size} selected
+            </button>
+          )}
+          <div style={{display:"flex",gap:8}}>
+            <input placeholder="New focus area name…" value={newArea} onChange={e=>setNewArea(e.target.value)} onKeyDown={e=>{ if(e.key==="Enter") addFocusArea(); }} style={{flex:1}} />
+            <button className="btn btn-primary btn-sm" onClick={addFocusArea} style={{whiteSpace:"nowrap"}}>+ Add</button>
+          </div>
+        </div>
+
+        {/* Data Reset */}
         <div className="card">
           <div className="card-title">⚙️ Data & Reset</div>
           {rows.map(r=>(
@@ -1005,13 +1884,14 @@ function Settings({ sessions, setSessions, pieces, setPieces, goals, setGoals, r
             </div>
           ))}
         </div>
+
       </div>
     </>
   );
 }
 
 // ── APP ───────────────────────────────────────────────────────────────────────
-const TABS = ["Dashboard","Log","Repertoire","Goals","Statistics","Reminders","Export","Metronome","Settings"];
+const TABS = ["Dashboard","Log","Repertoire","Goals","Statistics","Reminders","Metronome","Settings"];
 
 export default function App() {
   const [tab, setTab] = useState("Dashboard");
@@ -1019,13 +1899,30 @@ export default function App() {
   const [pieces, setPieces] = useState([]);
   const [goals, setGoals] = useState([]);
   const [reminders, setReminders] = useState([]);
+  const [focusAreas, setFocusAreas] = useState(DEFAULT_FOCUS_AREAS);
   const [loaded, setLoaded] = useState(false);
   const [unit, setUnit] = useState("min");
+  const [incomingPkg, setIncomingPkg] = useState(null);
 
   useEffect(() => {
     (async () => {
-      const [s,p,g,r] = await Promise.all([sGet(SK.sessions),sGet(SK.pieces),sGet(SK.goals),sGet(SK.reminders)]);
+      const [s,p,g,r,fa] = await Promise.all([sGet(SK.sessions),sGet(SK.pieces),sGet(SK.goals),sGet(SK.reminders),sGet(SK.focusAreas)]);
       if (s) setSessions(s); if (p) setPieces(p); if (g) setGoals(g); if (r) setReminders(r);
+      if (fa) setFocusAreas(fa);
+      // Check for incoming practice package in URL
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const pkg = params.get("pkg");
+        if (pkg) {
+          const decoded = JSON.parse(atob(pkg));
+          if (decoded.type === "practice_package") {
+            setIncomingPkg(decoded);
+            setTab("Settings");
+            // Clean URL without reloading
+            window.history.replaceState({}, "", window.location.pathname);
+          }
+        }
+      } catch {}
       setLoaded(true);
     })();
   }, []);
@@ -1044,14 +1941,13 @@ export default function App() {
         <div className="main">
           {!loaded&&<div className="empty-state">Loading your practice data…</div>}
           {loaded&&tab==="Dashboard"&&<Dashboard sessions={sessions} pieces={pieces} goals={goals} setGoals={setGoals} unit={unit} />}
-          {loaded&&tab==="Log"&&<LogSession sessions={sessions} setSessions={setSessions} unit={unit} />}
+          {loaded&&tab==="Log"&&<LogSession sessions={sessions} setSessions={setSessions} unit={unit} goals={goals} focusAreas={focusAreas} pieces={pieces} setPieces={setPieces} />}
           {loaded&&tab==="Repertoire"&&<Pieces pieces={pieces} setPieces={setPieces} sessions={sessions} />}
           {loaded&&tab==="Goals"&&<Goals goals={goals} setGoals={setGoals} sessions={sessions} unit={unit} />}
           {loaded&&tab==="Statistics"&&<Stats sessions={sessions} unit={unit} />}
-          {loaded&&tab==="Reminders"&&<Reminders reminders={reminders} setReminders={setReminders} />}
-          {loaded&&tab==="Export"&&<Export sessions={sessions} pieces={pieces} goals={goals} unit={unit} />}
+          {loaded&&tab==="Reminders"&&<Reminders reminders={reminders} setReminders={setReminders} focusAreas={focusAreas} />}
           {loaded&&tab==="Metronome"&&<Metronome />}
-          {loaded&&tab==="Settings"&&<Settings sessions={sessions} setSessions={setSessions} pieces={pieces} setPieces={setPieces} goals={goals} setGoals={setGoals} reminders={reminders} setReminders={setReminders} />}
+          {loaded&&tab==="Settings"&&<Settings sessions={sessions} setSessions={setSessions} pieces={pieces} setPieces={setPieces} goals={goals} setGoals={setGoals} reminders={reminders} setReminders={setReminders} focusAreas={focusAreas} setFocusAreas={setFocusAreas} unit={unit} incomingPkg={incomingPkg} setIncomingPkg={setIncomingPkg} />}
         </div>
       </div>
     </>
